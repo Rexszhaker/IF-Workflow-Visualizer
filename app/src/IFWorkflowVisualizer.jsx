@@ -3,7 +3,7 @@ import {
   ChevronDown, ChevronRight, Plus, Trash2, Copy,
   ArrowUp, ArrowDown, Download, GripVertical, FileText,
   Layers, ArrowRightLeft, Eye, Move, LayoutGrid,
-  Upload, Clipboard, FileSpreadsheet, Image as ImageIcon, ChevronUp, PenLine, FileText as FileTextIcon,
+  Upload, Clipboard, FileSpreadsheet, Image as ImageIcon, ChevronUp, PenLine,
   FilePlus, Check, Sprout, Sparkles
 } from "lucide-react";
 import * as XLSX from "xlsx";
@@ -33,7 +33,7 @@ const OP_STYLE = {
   "Full Auto":  { bg: "#F96167", emoji: "\u26A1" },
 };
 
-let _uid = 100;
+let _uid = Date.now();
 const uid = () => `s${_uid++}`;
 
 // ─── localStorage persistence + migration ────────────────────────────────────
@@ -207,6 +207,19 @@ function PainDots({ x, y, level, r: radius }) {
 // ─── Arrows (Connection-based) ──────────────────────────────────────────────
 function Arrows({ steps, positions, b, nodeSizes, compact, connections, dashedIds, onDeleteConnection }) {
   const [hovered, setHovered] = useState(null);
+  const hoverLockRef = useRef(false);
+
+  const handleEnter = useCallback((ci) => {
+    if (!hoverLockRef.current) setHovered(ci);
+  }, []);
+
+  const handleDelete = useCallback((e, ci) => {
+    e.stopPropagation();
+    hoverLockRef.current = true;
+    setHovered(null);
+    onDeleteConnection(ci);
+    setTimeout(() => { hoverLockRef.current = false; }, 300);
+  }, [onDeleteConnection]);
 
   return <>
     {(connections || []).map((conn, ci) => {
@@ -250,7 +263,7 @@ function Arrows({ steps, positions, b, nodeSizes, compact, connections, dashedId
 
       return (
         <g key={`${conn.from}-${conn.to}-${ci}`}
-          onMouseEnter={() => setHovered(ci)} onMouseLeave={() => setHovered(null)}>
+          onMouseEnter={() => handleEnter(ci)} onMouseLeave={() => setHovered(null)}>
           <path d={d} fill="none" stroke="transparent" strokeWidth={30} style={{ cursor: "pointer" }} />
           {isHov && <path d={d} fill="none" stroke="#F96167" strokeWidth={6} opacity={0.2} />}
           <path d={d} fill="none" stroke={isHov ? "#F96167" : "#94A3B8"} strokeWidth={isHov ? 3 : 2}
@@ -258,7 +271,7 @@ function Arrows({ steps, positions, b, nodeSizes, compact, connections, dashedId
             style={{ transition: "stroke 0.15s, stroke-width 0.15s" }} />
           {isHov && onDeleteConnection && (
             <g transform={`translate(${midX},${midY})`}
-              onClick={e => { e.stopPropagation(); setHovered(null); onDeleteConnection(ci); }}
+              onClick={e => handleDelete(e, ci)}
               style={{ cursor: "pointer" }}>
               <circle r={14} fill="#EF4444" stroke="#fff" strokeWidth={2.5} />
               <line x1={-5} y1={-5} x2={5} y2={5} stroke="#fff" strokeWidth={2.5} strokeLinecap="round" />
@@ -339,7 +352,7 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
       // No custom positions yet — defaultPos will auto-recalculate, nothing to do
     }
   }, [stepsKey]);
-  useEffect(() => { setCustomPos(null); setConnectFrom(null); setConnectMouse(null); }, [tidyKey]);
+  useEffect(() => { setCustomPos(null); setConnectFrom(null); setConnectMouse(null); setPanOffset({ x: 0, y: 0 }); setZoom(1); }, [tidyKey]);
   // Clear selection if step removed
   useEffect(() => {
     if (selectedNode && !steps.find(s => s.id === selectedNode)) setSelectedNode(null);
@@ -454,7 +467,16 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
     if (!e.ctrlKey && !e.metaKey) return; // Allow normal scroll; only Ctrl+scroll zooms
     e.preventDefault();
     const delta = e.deltaY > 0 ? -0.1 : 0.1;
-    setZoom(prev => Math.min(3.0, Math.max(0.3, Math.round((prev + delta) * 10) / 10)));
+    setZoom(prev => {
+      const next = Math.min(3.0, Math.max(0.3, Math.round((prev + delta) * 10) / 10));
+      // Adjust pan to keep zoom centered on cursor
+      const ratio = next / prev;
+      setPanOffset(po => ({
+        x: e.clientX - ratio * (e.clientX - po.x),
+        y: e.clientY - ratio * (e.clientY - po.y),
+      }));
+      return next;
+    });
   }, []);
 
   const zoomIn = useCallback(() => setZoom(prev => Math.min(3.0, Math.round((prev + 0.2) * 10) / 10)), []);
@@ -479,7 +501,7 @@ function AsIsChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
   const handleKeyDown = useCallback((e) => {
     if ((e.key === "Delete" || e.key === "Backspace") && selectedNode && onDeleteStep) {
       e.preventDefault();
-      onDeleteStep(selectedNode);
+      onDeleteStep(selectedNode, true);
       setSelectedNode(null);
     }
     if (e.key === "Escape") setSelectedNode(null);
@@ -594,7 +616,7 @@ function ToBeChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
   const handleKeyDown = useCallback((e) => {
     if ((e.key === "Delete" || e.key === "Backspace") && selectedNode && onDeleteStep) {
       e.preventDefault();
-      onDeleteStep(selectedNode);
+      onDeleteStep(selectedNode, true);
       setSelectedNode(null);
     }
     if (e.key === "Escape") setSelectedNode(null);
@@ -834,7 +856,7 @@ function Stats({ stepsAsIs, stepsToBe, mode }) {
         <div className="bg-white rounded-xl border border-slate-200 p-4">
           <div className="text-xs text-slate-500 mb-2">Steps by Operator</div>
           <div className="flex flex-wrap gap-2">
-            {OPERATORS.map(o => counts[o] > 0 && (
+            {OPERATORS.filter(o => counts[o] > 0).map(o => (
               <span key={o} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium text-white" style={{ backgroundColor: OP_STYLE[o].bg }}>
                 {OP_STYLE[o].emoji} {"\u00D7"}{counts[o]}
               </span>
@@ -1016,8 +1038,8 @@ function useStepActions(setSteps, setConns, setNS, setExp) {
     setSteps(prev => prev.map(s => s.id === id ? { ...s, [key]: val } : s));
   }, [setSteps]);
 
-  const del = useCallback((id) => {
-    if (!window.confirm("Delete this step?")) return;
+  const del = useCallback((id, skipConfirm = false) => {
+    if (!skipConfirm && !window.confirm("Delete this step?")) return;
     setSteps(prev => prev.filter(s => s.id !== id));
     setExp(prev => { const n = new Set(prev); n.delete(id); return n; });
     setConns(prev => prev ? prev.filter(c => c.from !== id && c.to !== id) : null);
@@ -1119,7 +1141,7 @@ export default function IFWorkflowVisualizer() {
   const saveCountRef = useRef(0);
   useEffect(() => {
     saveCountRef.current++;
-    if (saveCountRef.current <= 1 && _saved) return;
+    if (saveCountRef.current <= 1) return; // Skip first render — don't save defaults before user interaction
     const timer = setTimeout(() => {
       try {
         const data = {
@@ -1289,10 +1311,12 @@ export default function IFWorkflowVisualizer() {
     } catch {
       const svgData = cloneSvg();
       if (svgData) {
+        // PNG failed (likely foreignObject issue) — fall back to SVG
         const blob = new Blob([svgData.str], { type: "image/svg+xml" });
         downloadBlob(blob, fname("svg"));
+        alert("PNG export is not supported in this browser. Exported as SVG instead.\nTip: Use the SVG or PPTX export for best results.");
       } else {
-        alert("Export failed. Please use your browser\u2019s screenshot tool.");
+        alert("Export failed. Please use your browser\u2019s screenshot tool (Ctrl+Shift+S).");
       }
     }
   }, [cloneSvg, svgToPngBlob, downloadBlob, fname]);
@@ -1649,10 +1673,11 @@ ${cells}      </root>
     const data = {
       version: 2, meta, stepsAsIs, stepsToBe,
       connectionsAsIs, connectionsToBe,
+      nodeSizesAsIs, nodeSizesToBe,
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
     downloadBlob(blob, fname("json"));
-  }, [meta, stepsAsIs, stepsToBe, connectionsAsIs, connectionsToBe, downloadBlob, fname]);
+  }, [meta, stepsAsIs, stepsToBe, connectionsAsIs, connectionsToBe, nodeSizesAsIs, nodeSizesToBe, downloadBlob, fname]);
 
   // ── Import: JSON ──
   const fileInputRef = useRef(null);
@@ -1674,8 +1699,8 @@ ${cells}      </root>
         setStepsToBe(data.stepsToBe ?? null);
         setConnectionsAsIs(data.connectionsAsIs ?? null);
         setConnectionsToBe(data.connectionsToBe ?? null);
-        setNodeSizesAsIs({});
-        setNodeSizesToBe({});
+        setNodeSizesAsIs(data.nodeSizesAsIs || {});
+        setNodeSizesToBe(data.nodeSizesToBe || {});
         setTidyKey(k => k + 1);
       } catch (err) {
         alert("Invalid JSON file: " + err.message);
@@ -2029,6 +2054,9 @@ ${cells}      </root>
                 <div className="mb-4 flex items-center gap-3">
                   <h2 className="text-base font-bold text-slate-700">Workflow Comparison</h2>
                   {meta.workflowName && <span className="text-sm text-slate-400">{meta.workflowName}</span>}
+                  <span className="ml-auto flex items-center gap-1 text-xs text-slate-400">
+                    <Move className="w-3 h-3" /> Drag nodes {"\u00B7"} Ctrl+Scroll to zoom {"\u00B7"} Click to select {"\u00B7"} Del to remove
+                  </span>
                 </div>
                 <div className="space-y-8">
                   <div>
