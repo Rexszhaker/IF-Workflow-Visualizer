@@ -11,12 +11,32 @@ import PptxGenJS from "pptxgenjs";
 import { Document, Packer, Paragraph, Table, TableRow, TableCell, WidthType, AlignmentType, TextRun, HeadingLevel, BorderStyle } from "docx";
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+const MODE = { AS_IS: "as-is", TO_BE: "to-be", COMPARE: "compare" };
 const DEPARTMENTS = ["Design & Production", "Project Management", "BD", "Compliance & Admin", "Other"];
 const FREQUENCIES = ["Daily", "Weekly", "Per-project", "Ad-hoc"];
 const OPERATORS = ["Human Only", "Human+AI", "AI-Led", "Full Auto"];
+const DEFAULT_OPERATOR = OPERATORS[0];
 const AI_TOOLS = ["Gemini", "Gemini Gem", "Google Workspace", "NotebookLM", "Google AI Studio", "n8n", "None", "Other"];
+const NO_AI_TOOL = "None";
 const ERROR_FREQS = ["Low", "Medium", "High"];
 const MAX_STEPS = 20;
+
+function getStepColors(step, isToBe) {
+  if (isToBe) {
+    const os = OP_STYLE[step.operator] || OP_STYLE[DEFAULT_OPERATOR];
+    return { fill: os.bg.replace("#", ""), stroke: os.bg.replace("#", ""), text: "FFFFFF", fillRaw: os.bg, strokeRaw: os.bg, textRaw: "#FFFFFF" };
+  }
+  const ps = PAIN[step.painLevel] || PAIN[1];
+  return { fill: ps.bg.replace("#", ""), stroke: ps.border.replace("#", ""), text: "1E293B", fillRaw: ps.bg, strokeRaw: ps.border, textRaw: "#1E293B" };
+}
+
+function computeSummary(stepsAsIs, stepsToBe) {
+  const totalAsIs = stepsAsIs.reduce((a, s) => a + s.timeHours, 0);
+  const totalToBe = (stepsToBe || []).reduce((a, s) => a + s.timeHours, 0);
+  const saved = totalAsIs - totalToBe;
+  const pct = totalAsIs > 0 ? Math.round((saved / totalAsIs) * 100) : 0;
+  return { totalAsIs, totalToBe, saved, pct };
+}
 
 const PAIN = {
   1: { bg: "#DCFCE7", border: "#10B981" },
@@ -208,6 +228,10 @@ function PainDots({ x, y, level, r: radius }) {
 function Arrows({ steps, positions, b, nodeSizes, compact, connections, dashedIds, onDeleteConnection }) {
   const [hovered, setHovered] = useState(null);
   const hoverLockRef = useRef(false);
+  const lockTimerRef = useRef(null);
+
+  // Cleanup lock timer on unmount
+  useEffect(() => () => { if (lockTimerRef.current) clearTimeout(lockTimerRef.current); }, []);
 
   const handleEnter = useCallback((ci) => {
     if (!hoverLockRef.current) setHovered(ci);
@@ -218,13 +242,17 @@ function Arrows({ steps, positions, b, nodeSizes, compact, connections, dashedId
     hoverLockRef.current = true;
     setHovered(null);
     onDeleteConnection(ci);
-    setTimeout(() => { hoverLockRef.current = false; }, 300);
+    if (lockTimerRef.current) clearTimeout(lockTimerRef.current);
+    lockTimerRef.current = setTimeout(() => { hoverLockRef.current = false; }, 300);
   }, [onDeleteConnection]);
+
+  // Build lookup map to avoid O(N) findIndex per connection
+  const idxMap = useMemo(() => new Map(steps.map((s, i) => [s.id, i])), [steps]);
 
   return <>
     {(connections || []).map((conn, ci) => {
-      const fromIdx = steps.findIndex(s => s.id === conn.from);
-      const toIdx = steps.findIndex(s => s.id === conn.to);
+      const fromIdx = idxMap.get(conn.from) ?? -1;
+      const toIdx = idxMap.get(conn.to) ?? -1;
       if (fromIdx < 0 || toIdx < 0) return null;
       const fromPos = positions[fromIdx];
       const toPos = positions[toIdx];
@@ -323,8 +351,12 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [selectedNode, setSelectedNode] = useState(null);
   const dragStartRef = useRef(null);
-  const stepsKey = steps.map(s => s.id).join(",");
+  const rafRef = useRef(null);
+  const stepsKey = useMemo(() => steps.map(s => s.id).join(","), [steps]);
   const prevStepsRef = useRef(steps.map(s => s.id));
+
+  // Cleanup rAF on unmount
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); }, []);
 
   useEffect(() => {
     const prevIds = prevStepsRef.current;
@@ -407,7 +439,9 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
   const onMove = useCallback((e) => {
     if (connectFrom) {
       e.preventDefault();
-      setConnectMouse(toSvg(e));
+      // rAF throttle connect mouse updates
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      rafRef.current = requestAnimationFrame(() => setConnectMouse(toSvg(e)));
       return;
     }
     if (!interRef.current) {
@@ -426,20 +460,24 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
       const dy = e.clientY - dragStartRef.current.y;
       if (Math.abs(dx) > 4 || Math.abs(dy) > 4) dragStartRef.current.moved = true;
     }
-    const sp = toSvg(e);
-    if (interRef.current.type === "drag") {
-      const { idx, ox, oy } = interRef.current;
-      setCustomPos(prev => {
-        const next = [...(prev || defaultPos.map(p => ({ ...p })))];
-        next[idx] = { x: sp.x - ox, y: sp.y - oy };
-        return next;
-      });
-    } else if (interRef.current.type === "resize") {
-      const { idx, startX, startY, origW, origH } = interRef.current;
-      const newW = Math.max(MIN_W, origW + (sp.x - startX));
-      const newH = Math.max(MIN_H, origH + (sp.y - startY));
-      onResizeNode?.(steps[idx].id, newW, newH);
-    }
+    // rAF throttle drag/resize updates
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => {
+      const sp = toSvg(e);
+      if (interRef.current?.type === "drag") {
+        const { idx, ox, oy } = interRef.current;
+        setCustomPos(prev => {
+          const next = [...(prev || defaultPos.map(p => ({ ...p })))];
+          next[idx] = { x: sp.x - ox, y: sp.y - oy };
+          return next;
+        });
+      } else if (interRef.current?.type === "resize") {
+        const { idx, startX, startY, origW, origH } = interRef.current;
+        const newW = Math.max(MIN_W, origW + (sp.x - startX));
+        const newH = Math.max(MIN_H, origH + (sp.y - startY));
+        onResizeNode?.(steps[idx].id, newW, newH);
+      }
+    });
   }, [toSvg, defaultPos, connectFrom, steps, onResizeNode]);
 
   const onUp = useCallback(() => {
@@ -458,7 +496,7 @@ function useDrag(steps, b, tidyKey, nodeSizes, compact, onResizeNode, onConnect,
 
   const onBgClick = useCallback((e) => {
     // Only deselect if clicking directly on the SVG background (not on a node)
-    if (e.target.tagName === 'rect' && e.target.getAttribute('fill') === 'url(#dots)') {
+    if (e.target.dataset?.bg === '1') {
       setSelectedNode(null);
     }
   }, []);
@@ -512,12 +550,12 @@ function AsIsChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
 
   return (
     <div className="relative">
-      <svg ref={svgRef} viewBox={zVb} className="w-full h-auto focus:outline-none" xmlns="http://www.w3.org/2000/svg"
+      <svg ref={svgRef} viewBox={zVb} className="w-full h-auto focus:outline-none" xmlns="http://www.w3.org/2000/svg" data-chart
         onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onClick={onBgClick}
         onWheel={onWheel} tabIndex={0} onKeyDown={handleKeyDown}
         style={{ minHeight: 200 }}>
         <SvgDefs />
-        <rect x={-9999} y={-9999} width={99999} height={99999} fill="url(#dots)" />
+        <rect x={-9999} y={-9999} width={99999} height={99999} fill="url(#dots)" data-bg="1" />
         <Arrows steps={steps} positions={pos} b={b} nodeSizes={nodeSizes} compact={compact}
           connections={connections} onDeleteConnection={onDeleteConnection} />
         <ConnectingLine fromStepId={connectFrom} mousePos={connectMouse}
@@ -610,8 +648,10 @@ function ToBeChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
   const vbParts = vb.split(/[\s,]+/).map(Number);
   const zVb = `${vbParts[0] - panOffset.x / zoom} ${vbParts[1] - panOffset.y / zoom} ${vbParts[2] / zoom} ${vbParts[3] / zoom}`;
 
-  const autoOps = new Set(["AI-Led", "Full Auto"]);
-  const dashedIds = new Set(steps.filter(s => autoOps.has(s.operator)).map(s => s.id));
+  const dashedIds = useMemo(() => {
+    const autoOps = new Set(["AI-Led", "Full Auto"]);
+    return new Set(steps.filter(s => autoOps.has(s.operator)).map(s => s.id));
+  }, [steps]);
 
   const handleKeyDown = useCallback((e) => {
     if ((e.key === "Delete" || e.key === "Backspace") && selectedNode && onDeleteStep) {
@@ -627,12 +667,12 @@ function ToBeChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
 
   return (
     <div className="relative">
-      <svg ref={svgRef} viewBox={zVb} className="w-full h-auto focus:outline-none" xmlns="http://www.w3.org/2000/svg"
+      <svg ref={svgRef} viewBox={zVb} className="w-full h-auto focus:outline-none" xmlns="http://www.w3.org/2000/svg" data-chart
         onMouseMove={onMove} onMouseUp={onUp} onMouseLeave={onUp} onClick={onBgClick}
         onWheel={onWheel} tabIndex={0} onKeyDown={handleKeyDown}
         style={{ minHeight: 200 }}>
         <SvgDefs />
-        <rect x={-9999} y={-9999} width={99999} height={99999} fill="url(#dots)" />
+        <rect x={-9999} y={-9999} width={99999} height={99999} fill="url(#dots)" data-bg="1" />
         <Arrows steps={steps} positions={pos} b={b} nodeSizes={nodeSizes} compact={compact}
           connections={connections} dashedIds={dashedIds} onDeleteConnection={onDeleteConnection} />
         <ConnectingLine fromStepId={connectFrom} mousePos={connectMouse}
@@ -758,9 +798,7 @@ function ToBeChart({ steps, compact, connections, nodeSizes, tidyKey, onDeleteCo
 
 // ─── Compare Bar Chart (HTML) — Aggregate comparison ─────────────────────────
 function BarChart({ stepsAsIs, stepsToBe }) {
-  const totalAsIs = stepsAsIs.reduce((a, s) => a + s.timeHours, 0);
-  const totalToBe = (stepsToBe || []).reduce((a, s) => a + s.timeHours, 0);
-  const pct = totalAsIs > 0 ? Math.round((1 - totalToBe / totalAsIs) * 100) : 0;
+  const { totalAsIs, totalToBe, pct } = computeSummary(stepsAsIs, stepsToBe);
   const maxT = Math.max(totalAsIs, totalToBe, 1);
   const maxStep = Math.max(
     ...stepsAsIs.map(s => s.timeHours),
@@ -826,10 +864,7 @@ function BarChart({ stepsAsIs, stepsToBe }) {
 
 // ─── Summary Stats ───────────────────────────────────────────────────────────
 function Stats({ stepsAsIs, stepsToBe, mode }) {
-  const asIs = stepsAsIs.reduce((a, s) => a + s.timeHours, 0);
-  const toBe = (stepsToBe || []).reduce((a, s) => a + s.timeHours, 0);
-  const saved = asIs - toBe;
-  const pct = asIs > 0 ? Math.round((saved / asIs) * 100) : 0;
+  const { totalAsIs: asIs, totalToBe: toBe, saved, pct } = computeSummary(stepsAsIs, stepsToBe);
   const counts = {};
   OPERATORS.forEach(o => { counts[o] = (stepsToBe || []).filter(s => s.operator === o).length; });
   const showToBe = (mode === "to-be" || mode === "compare") && stepsToBe;
@@ -1094,7 +1129,7 @@ function useStepActions(setSteps, setConns, setNS, setExp) {
 
 // ─── Main Component ──────────────────────────────────────────────────────────
 export default function IFWorkflowVisualizer() {
-  const [mode, setMode] = useState(_saved?.mode || "as-is");
+  const [mode, setMode] = useState(_saved?.mode || MODE.AS_IS);
   const [meta, setMeta] = useState(_saved?.meta || INIT_META);
   const [stepsAsIs, setStepsAsIs] = useState(_saved?.stepsAsIs || INIT_STEPS_AS_IS);
   const [stepsToBe, setStepsToBe] = useState(_saved?.stepsToBe ?? null);
@@ -1128,7 +1163,7 @@ export default function IFWorkflowVisualizer() {
   const addToBeStep = useCallback(() => {
     if ((stepsToBe || []).length >= MAX_STEPS) { alert(`Maximum ${MAX_STEPS} steps reached. Consider consolidating steps.`); return; }
     const id = uid();
-    setStepsToBe(prev => [...(prev || []), { id, name: "", operator: "Human Only", aiTool: "None", aiAction: "", humanCheck: "", timeHours: 1 }]);
+    setStepsToBe(prev => [...(prev || []), { id, name: "", operator: DEFAULT_OPERATOR, aiTool: NO_AI_TOOL, aiAction: "", humanCheck: "", timeHours: 1 }]);
     setExpanded(prev => new Set([...prev, id]));
     // Auto-connect from last step if connections are in explicit mode
     if (connectionsToBe !== null && stepsToBe && stepsToBe.length > 0) {
@@ -1139,6 +1174,7 @@ export default function IFWorkflowVisualizer() {
 
   // ── Auto-save to localStorage (debounced 500ms) ──
   const saveCountRef = useRef(0);
+  const statusTimerRef = useRef(null);
   useEffect(() => {
     saveCountRef.current++;
     if (saveCountRef.current <= 1) return; // Skip first render — don't save defaults before user interaction
@@ -1151,11 +1187,15 @@ export default function IFWorkflowVisualizer() {
         };
         localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
         setSaveStatus("saved");
-        setTimeout(() => setSaveStatus(null), 2000);
+        if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+        statusTimerRef.current = setTimeout(() => setSaveStatus(null), 2000);
       } catch {}
     }, 500);
     return () => clearTimeout(timer);
   }, [mode, meta, stepsAsIs, stepsToBe, connectionsAsIs, connectionsToBe, nodeSizesAsIs, nodeSizesToBe]);
+
+  // Cleanup status timer on unmount
+  useEffect(() => () => { if (statusTimerRef.current) clearTimeout(statusTimerRef.current); }, []);
 
   useEffect(() => {
     if (saveStatus === "restored") {
@@ -1195,7 +1235,7 @@ export default function IFWorkflowVisualizer() {
   // ── Seed To-Be from As-Is ──
   const seedToBeFromAsIs = useCallback(() => {
     const seeded = stepsAsIs.map(s => ({
-      id: uid(), name: s.name, operator: "Human Only", aiTool: "None",
+      id: uid(), name: s.name, operator: DEFAULT_OPERATOR, aiTool: NO_AI_TOOL,
       aiAction: "", humanCheck: "", timeHours: s.timeHours,
     }));
     setStepsToBe(seeded);
@@ -1225,7 +1265,7 @@ export default function IFWorkflowVisualizer() {
   const handleNewWorkflow = useCallback(() => {
     if (!window.confirm("Start a new workflow? Current progress will be cleared.")) return;
     try { localStorage.removeItem(STORAGE_KEY); } catch {}
-    setMode("as-is");
+    setMode(MODE.AS_IS);
     setMeta(INIT_META);
     setStepsAsIs(INIT_STEPS_AS_IS);
     setStepsToBe(null);
@@ -1242,11 +1282,7 @@ export default function IFWorkflowVisualizer() {
   const getSvgElement = useCallback(() => {
     const container = vizRef.current;
     if (!container) return null;
-    const allSvgs = container.querySelectorAll("svg");
-    for (const s of allSvgs) {
-      if (s.classList.contains("w-full")) return s;
-    }
-    return null;
+    return container.querySelector("svg[data-chart]") || null;
   }, []);
 
   const cloneSvg = useCallback(() => {
@@ -1372,15 +1408,12 @@ export default function IFWorkflowVisualizer() {
       XLSX.utils.book_append_sheet(wb, wsToBe, "To-Be Steps");
 
       // Summary sheet
-      const totalAsIs = stepsAsIs.reduce((a, s) => a + s.timeHours, 0);
-      const totalToBe = stepsToBe.reduce((a, s) => a + s.timeHours, 0);
-      const saved = totalAsIs - totalToBe;
-      const pct = totalAsIs > 0 ? Math.round((saved / totalAsIs) * 100) : 0;
+      const sm = computeSummary(stepsAsIs, stepsToBe);
       const summaryData = [
         ["Metric", "Value"],
         ["As-Is Steps", stepsAsIs.length], ["To-Be Steps", stepsToBe.length],
-        ["As-Is Total Time", `${totalAsIs}h`], ["To-Be Total Time", `${totalToBe}h`],
-        ["Time Saved", `${saved}h (${pct}%)`],
+        ["As-Is Total Time", `${sm.totalAsIs}h`], ["To-Be Total Time", `${sm.totalToBe}h`],
+        ["Time Saved", `${sm.saved}h (${sm.pct}%)`],
       ];
       const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
       wsSummary["!cols"] = [{ wch: 20 }, { wch: 20 }];
@@ -1434,19 +1467,12 @@ export default function IFWorkflowVisualizer() {
           const p = positions[i];
           if (!p) return;
           const nx = padX + toIn(p.x), ny = padY + toIn(p.y), nw = toIn(p.w), nh = toIn(p.h);
-          let fillColor, lineColor, textColor;
-          if (isToBe) {
-            const os = OP_STYLE[s.operator] || OP_STYLE["Human Only"];
-            fillColor = os.bg.replace("#", ""); lineColor = fillColor; textColor = "FFFFFF";
-          } else {
-            const ps = PAIN[s.painLevel] || PAIN[1];
-            fillColor = ps.bg.replace("#", ""); lineColor = ps.border.replace("#", ""); textColor = "1E293B";
-          }
-          slide.addShape(prs.ShapeType.roundRect, { x: nx, y: ny, w: nw, h: nh, fill: { color: fillColor }, line: { color: lineColor, width: 1.5 }, rectRadius: 0.08 });
+          const sc = getStepColors(s, isToBe);
+          slide.addShape(prs.ShapeType.roundRect, { x: nx, y: ny, w: nw, h: nh, fill: { color: sc.fill }, line: { color: sc.stroke, width: 1.5 }, rectRadius: 0.08 });
           const label = isToBe
-            ? `${s.operator}\n${s.name}${s.aiTool !== "None" ? `\n${s.aiTool}` : ""}${s.aiAction ? `\nAI: ${s.aiAction}` : ""}${s.humanCheck ? `\nCheck: ${s.humanCheck}` : ""}\n${s.timeHours}h`
+            ? `${s.operator}\n${s.name}${s.aiTool !== NO_AI_TOOL ? `\n${s.aiTool}` : ""}${s.aiAction ? `\nAI: ${s.aiAction}` : ""}${s.humanCheck ? `\nCheck: ${s.humanCheck}` : ""}\n${s.timeHours}h`
             : `${s.name}\n${s.owner || ""}\n${s.timeHours}h`;
-          slide.addText(label, { x: nx + 0.05, y: ny + 0.05, w: nw - 0.1, h: nh - 0.1, fontSize: nw > 1.5 ? 10 : 8, fontFace: "Arial", color: textColor, valign: "middle", align: "center", bold: true, wrap: true });
+          slide.addText(label, { x: nx + 0.05, y: ny + 0.05, w: nw - 0.1, h: nh - 0.1, fontSize: nw > 1.5 ? 10 : 8, fontFace: "Arial", color: sc.text, valign: "middle", align: "center", bold: true, wrap: true });
         });
 
         conns.forEach(conn => {
@@ -1473,18 +1499,15 @@ export default function IFWorkflowVisualizer() {
       // Stats slide
       const slide3 = prs.addSlide();
       slide3.addText("Summary", { x: 0.5, y: 0.2, w: 9, h: 0.5, fontSize: 20, fontFace: "Arial", bold: true, color: "1E293B" });
-      const asIs = stepsAsIs.reduce((a, s) => a + s.timeHours, 0);
-      const toBe = (stepsToBe || []).reduce((a, s) => a + s.timeHours, 0);
-      const saved = asIs - toBe;
-      const pctSaved = asIs > 0 ? Math.round((saved / asIs) * 100) : 0;
+      const summary = computeSummary(stepsAsIs, stepsToBe);
       const statsRows = [
         [{ text: "Metric", options: { bold: true, color: "FFFFFF", fill: { color: "1E293B" } } },
          { text: "Value", options: { bold: true, color: "FFFFFF", fill: { color: "1E293B" } } }],
         ["As-Is Steps", String(stepsAsIs.length)],
         ["To-Be Steps", String((stepsToBe || []).length)],
-        ["As-Is Total Time", `${asIs}h`],
-        ["To-Be Total Time", `${toBe}h`],
-        ["Time Saved", `${saved}h (${pctSaved}%)`],
+        ["As-Is Total Time", `${summary.totalAsIs}h`],
+        ["To-Be Total Time", `${summary.totalToBe}h`],
+        ["Time Saved", `${summary.saved}h (${summary.pct}%)`],
       ];
       OPERATORS.forEach(o => {
         const count = (stepsToBe || []).filter(s => s.operator === o).length;
@@ -1511,19 +1534,12 @@ export default function IFWorkflowVisualizer() {
     steps.forEach((s, i) => {
       const p = positions[i];
       if (!p) return;
-      let fillColor, strokeColor, fontColor;
-      if (isToBe) {
-        const os = OP_STYLE[s.operator] || OP_STYLE["Human Only"];
-        fillColor = os.bg; strokeColor = os.bg; fontColor = "#FFFFFF";
-      } else {
-        const ps = PAIN[s.painLevel] || PAIN[1];
-        fillColor = ps.bg; strokeColor = ps.border; fontColor = "#1E293B";
-      }
+      const sc = getStepColors(s, isToBe);
       const label = isToBe
-        ? `${s.operator}\\n${esc(s.name)}${s.aiTool !== "None" ? `\\n${s.aiTool}` : ""}${s.aiAction ? `\\n${esc(s.aiAction)}` : ""}\\n${s.timeHours}h`
+        ? `${s.operator}\\n${esc(s.name)}${s.aiTool !== NO_AI_TOOL ? `\\n${s.aiTool}` : ""}${s.aiAction ? `\\n${esc(s.aiAction)}` : ""}\\n${s.timeHours}h`
         : `${esc(s.name)}\\n${esc(s.owner)}\\n${s.timeHours}h`;
 
-      cells += `        <mxCell id="n_${s.id}" value="${label}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${fillColor};strokeColor=${strokeColor};fontColor=${fontColor};fontStyle=1;fontSize=12;arcSize=8;" vertex="1" parent="1">\n`;
+      cells += `        <mxCell id="n_${s.id}" value="${label}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=${sc.fillRaw};strokeColor=${sc.strokeRaw};fontColor=${sc.textRaw};fontStyle=1;fontSize=12;arcSize=8;" vertex="1" parent="1">\n`;
       cells += `          <mxGeometry x="${p.x}" y="${p.y}" width="${p.w}" height="${p.h}" as="geometry"/>\n`;
       cells += `        </mxCell>\n`;
     });
@@ -1567,33 +1583,26 @@ ${cells}      </root>
         const rowCells = [];
 
         rowSteps.forEach((s, ci) => {
-          let bgColor, textColor;
-          if (isToBe) {
-            const os = OP_STYLE[s.operator] || OP_STYLE["Human Only"];
-            bgColor = os.bg.replace("#", ""); textColor = "FFFFFF";
-          } else {
-            const ps = PAIN[s.painLevel] || PAIN[1];
-            bgColor = ps.bg.replace("#", ""); textColor = "1E293B";
-          }
+          const sc = getStepColors(s, isToBe);
 
           const cellParagraphs = [];
           if (isToBe) {
-            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.operator, bold: true, size: 16, color: textColor, font: "Arial" })] }));
+            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.operator, bold: true, size: 16, color: sc.text, font: "Arial" })] }));
           }
-          cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.name || "Untitled", bold: true, size: 20, color: textColor, font: "Arial" })] }));
-          if (!isToBe) cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.owner || "", size: 16, color: textColor, font: "Arial" })] }));
-          if (isToBe && s.aiTool !== "None") {
-            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.aiTool, size: 16, color: textColor, font: "Arial", italics: true })] }));
+          cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.name || "Untitled", bold: true, size: 20, color: sc.text, font: "Arial" })] }));
+          if (!isToBe) cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.owner || "", size: 16, color: sc.text, font: "Arial" })] }));
+          if (isToBe && s.aiTool !== NO_AI_TOOL) {
+            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: s.aiTool, size: 16, color: sc.text, font: "Arial", italics: true })] }));
           }
-          cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: `${s.timeHours}h`, size: 18, color: textColor, font: "Arial", bold: true })] }));
+          cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: `${s.timeHours}h`, size: 18, color: sc.text, font: "Arial", bold: true })] }));
           if (!isToBe) {
-            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: `Pain: ${"●".repeat(s.painLevel)}${"○".repeat(5 - s.painLevel)}`, size: 14, color: textColor, font: "Arial" })] }));
+            cellParagraphs.push(new Paragraph({ children: [new TextRun({ text: `Pain: ${"●".repeat(s.painLevel)}${"○".repeat(5 - s.painLevel)}`, size: 14, color: sc.text, font: "Arial" })] }));
           }
 
           rowCells.push(new TableCell({
             children: cellParagraphs,
             width: { size: 2200, type: WidthType.DXA },
-            shading: { fill: bgColor, type: "clear" },
+            shading: { fill: sc.fill, type: "clear" },
             margins: { top: 80, bottom: 80, left: 100, right: 100 },
           }));
 
